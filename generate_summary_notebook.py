@@ -42,7 +42,7 @@ OUTPUT_LANG = "ja"
 
 # COMMAND ----------
 
-# %pip install openai --quiet
+%pip install openai --quiet
 
 # COMMAND ----------
 
@@ -75,19 +75,25 @@ print(f"Host   : {host}")
 
 # COMMAND ----------
 
+from decimal import Decimal
+
+def _json_safe(v):
+    """Decimal → float に変換（json.dumps 対応）"""
+    return float(v) if isinstance(v, Decimal) else v
+
 def df_to_dict_list(df, limit=10):
-    return [row.asDict() for row in df.limit(limit).collect()]
+    return [{k: _json_safe(v) for k, v in row.asDict().items()}
+            for row in df.limit(limit).collect()]
 
 # アプリケーションサマリー
 app_summary = spark.sql(f"""
     SELECT
-        total_jobs, successful_jobs, failed_jobs,
-        ROUND(job_success_rate_pct, 1) AS job_success_rate_pct,
-        ROUND(total_shuffle_read_gb, 2)  AS total_shuffle_read_gb,
-        ROUND(total_shuffle_write_gb, 2) AS total_shuffle_write_gb,
-        ROUND(total_disk_spill_gb, 2)    AS total_disk_spill_gb,
-        ROUND(gc_overhead_pct, 1)        AS gc_overhead_pct,
-        ROUND(app_duration_min, 1)       AS app_duration_min
+        total_jobs, succeeded_jobs, failed_jobs,
+        ROUND(job_success_rate, 1)   AS job_success_rate,
+        ROUND(total_shuffle_gb, 2)   AS total_shuffle_gb,
+        ROUND(total_spill_gb, 2)     AS total_spill_gb,
+        ROUND(gc_overhead_pct, 1)    AS gc_overhead_pct,
+        ROUND(duration_min, 1)       AS duration_min
     FROM {SCHEMA}.gold_application_summary
     LIMIT 1
 """).collect()
@@ -104,9 +110,9 @@ bn_rows = df_to_dict_list(bn_summary, 20)
 
 # 遅いジョブ TOP5
 slow_jobs = spark.sql(f"""
-    SELECT job_id, ROUND(duration_sec, 1) AS duration_sec, job_result, stage_ids
+    SELECT job_id, ROUND(duration_ms / 1000.0, 1) AS duration_sec, job_result, stage_ids
     FROM {SCHEMA}.gold_job_performance
-    ORDER BY duration_sec DESC NULLS LAST
+    ORDER BY duration_ms DESC NULLS LAST
     LIMIT 5
 """)
 slow_job_rows = df_to_dict_list(slow_jobs)
@@ -270,6 +276,18 @@ print(top3_text)
 
 # COMMAND ----------
 
+from pyspark.sql.types import StructType, StructField, StringType, IntegerType, TimestampType
+
+_HISTORY_SCHEMA = StructType([
+    StructField("generated_at",  TimestampType(), True),
+    StructField("model_name",    StringType(),    True),
+    StructField("schema_name",   StringType(),    True),
+    StructField("summary_text",  StringType(),    True),
+    StructField("top3_text",     StringType(),    True),
+    StructField("prompt_tokens", IntegerType(),   True),
+    StructField("total_tokens",  IntegerType(),   True),
+])
+
 spark.sql(f"""
     CREATE TABLE IF NOT EXISTS {HISTORY_TABLE} (
         generated_at  TIMESTAMP,
@@ -289,9 +307,9 @@ spark.createDataFrame([{
     "schema_name"  : SCHEMA,
     "summary_text" : summary_text,
     "top3_text"    : top3_text,
-    "prompt_tokens": response.usage.prompt_tokens,
-    "total_tokens" : response.usage.total_tokens,
-}]).write.mode("append").saveAsTable(HISTORY_TABLE)
+    "prompt_tokens": int(response.usage.prompt_tokens),
+    "total_tokens" : int(response.usage.total_tokens),
+}], schema=_HISTORY_SCHEMA).write.mode("append").saveAsTable(HISTORY_TABLE)
 
 print(f"Saved to {HISTORY_TABLE}")
 
@@ -311,17 +329,27 @@ assert r.status_code == 200, f"GET dashboard failed: {r.status_code} {r.text}"
 current = r.json()
 serialized = json.loads(current["serialized_dashboard"])
 
-# textbox_spec を名前で特定して更新
+def set_text_widget(widget, text):
+    """textbox_spec / multilineTextboxSpec どちらの形式でも更新する"""
+    if "textbox_spec" in widget:
+        widget["textbox_spec"] = text
+    elif "multilineTextboxSpec" in widget:
+        widget["multilineTextboxSpec"] = {"lines": [line + "\n" for line in text.splitlines()]}
+    else:
+        # どちらもなければ multilineTextboxSpec で書き込む
+        widget["multilineTextboxSpec"] = {"lines": [line + "\n" for line in text.splitlines()]}
+
+# ウィジェットを名前で特定して更新
 updated_summary = False
 updated_top3    = False
 for page in serialized["pages"]:
     for item in page["layout"]:
         widget = item["widget"]
         if widget.get("name") == SUMMARY_WIDGET_NAME:
-            widget["textbox_spec"] = summary_text
+            set_text_widget(widget, summary_text)
             updated_summary = True
         elif widget.get("name") == TOP3_WIDGET_NAME:
-            widget["textbox_spec"] = top3_text
+            set_text_widget(widget, top3_text)
             updated_top3 = True
 
 assert updated_summary, f"Widget '{SUMMARY_WIDGET_NAME}' not found in dashboard"
